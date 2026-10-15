@@ -4,25 +4,26 @@ import sys
  
 import pandas as pd
  
-# ---------------------------------------------------------------------------
-# THE ONE BLOCK YOU ARE ALLOWED TO ARGUE ABOUT -- BEFORE YOU SEE ANY OUTPUT.
-# Weights are set in advance and do not move to make a preferred name rank
-# higher. If you want to test sensitivity, copy this file and label the copy
-# a sensitivity test.
-# ---------------------------------------------------------------------------
-WEIGHTS = {
-    "roic": 0.30,            # efficiency
-    "fcf_yield": 0.25,       # cheapness
-    "rev_cagr_3y": 0.25,     # growth
-    "net_debt_ebitda": 0.20, # survival
-}
- 
-# Metrics where a LOWER raw value is better. Their z-score gets negated so
-# that "positive is good" holds for all four.
-LOWER_IS_BETTER = {"net_debt_ebitda"}
+# The weights live in weights.py, which is its own first commit in this
+# repository -- made before any company data or results existed. They do not
+# move to make a preferred name rank higher. To test sensitivity, copy the file
+# and label the copy a sensitivity test.
+from weights import LOWER_IS_BETTER, WEIGHTS  # noqa: E402
  
 WINSOR_LIMITS = (0.05, 0.95)  # clip to the 5th/95th percentile within sector
 MIN_PER_SECTOR = 5            # below this, z-scores are too noisy to trust
+ZERO_VARIANCE_TOL = 1e-9      # relative: below this, treat the spread as zero
+ 
+# How many companies a sector needs before its z-scores carry information.
+# These are not taste -- they are arithmetic, and measurable:
+#   n = 1  ->  z is exactly 0.000 (no peers to deviate from)
+#   n = 2  ->  z is always +0.707 / -0.707 whatever the underlying values
+#   n = 3  ->  winsorizing clips all three to the median, variance goes to
+#              zero, and every z is exactly 0.000
+#   n = 4-5 ->  real but coarse; one name moves the whole sector's mean
+#   n >= 6  ->  usable
+RELIABLE_PER_SECTOR = 6
+ARTIFACT_PER_SECTOR = 3       # at or below this, scores are arithmetic, not measurement
  
  
 def winsorize(s: pd.Series) -> pd.Series:
@@ -32,8 +33,23 @@ def winsorize(s: pd.Series) -> pd.Series:
     clip thresholds. One company with a 400% ROIC accounting quirk would
     otherwise drag its sector's mean up and inflate its standard deviation,
     which distorts the score of every other company in that sector.
+ 
+    On the interpolation arguments -- these matter more than they look.
+ 
+    With a default (linear) percentile and only ~10 companies in a sector, the
+    95th percentile lands BETWEEN the top two observations, so the outlier is
+    roughly half of its own clip threshold. Push a company from 135% ROIC to
+    4000% and the threshold rises with it: the clipping is cosmetic and the
+    outlier still moves its peers' scores. Measured on the sample data, that
+    setup protected peers no better than not winsorizing at all.
+ 
+    Taking the inner observed value instead -- 'higher' at the bottom, 'lower'
+    at the top -- puts the threshold on a real data point at least one rank
+    inside the extreme. The outlier's magnitude then has no influence on
+    anything: it is clipped to its neighbour's value no matter how absurd it is.
     """
-    lo, hi = s.quantile(WINSOR_LIMITS[0]), s.quantile(WINSOR_LIMITS[1])
+    lo = s.quantile(WINSOR_LIMITS[0], interpolation="higher")
+    hi = s.quantile(WINSOR_LIMITS[1], interpolation="lower")
     return s.clip(lower=lo, upper=hi)
  
  
@@ -47,9 +63,17 @@ def zscore(s: pd.Series) -> pd.Series:
  
     ddof=1 (pandas default) is the sample standard deviation, matching Excel's
     STDEV / STDEV.S.
+ 
+    On the tolerance: `sd == 0` is not enough. Values that are identical through
+    arithmetic rather than being the same literal leave floating-point dust --
+    a real case measured here came out at 3.0e-17, not 0. That passes an
+    equality check, and dividing by it manufactured a z-score of +0.91 for
+    every company in the sector out of pure rounding noise, which then flowed
+    into the weighted score looking like signal. The comparison has to be a
+    tolerance relative to the data's own scale.
     """
     sd = s.std()
-    if sd == 0 or pd.isna(sd):   # guard: a sector where everyone is identical
+    if pd.isna(sd) or sd <= ZERO_VARIANCE_TOL * max(1e-12, abs(s.mean())):
         return pd.Series(0.0, index=s.index)
     return (s - s.mean()) / sd
  
@@ -120,11 +144,83 @@ def validate(df: pd.DataFrame, top_n: int) -> list[str]:
     return warnings
  
  
+def sector_report(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-sector count, best score, and whether that score can be trusted.
+ 
+    Replaces counting sectors by hand with COUNTIF/MAXIFS. The verdict column
+    answers one question only: is this sector's z-score arithmetic reliable?
+ 
+    It deliberately does NOT decide whether to hold a sector. That call depends
+    on the client -- their existing exposures, their income, their risk
+    tolerance -- and none of that is in this data. Two further warnings about
+    reading this table:
+ 
+    Best scores are NOT comparable across sectors. A +1.5 in Technology and a
+    +1.5 in Utilities each mean '1.5 standard deviations better than its own
+    peers'. Neither says one sector is more attractive than the other -- that
+    comparison is precisely what within-sector scoring removes. Picking which
+    sectors to hold by comparing this column drops the sector whose peer group
+    happened to be tightly clustered, not the weakest sector.
+ 
+    A sector flagged ARTIFACT has a best score that is a number, not a
+    measurement. Do not rank it, drop it, or keep it on that number.
+    """
+    rows = []
+    for sector, grp in df.groupby("sector"):
+        n = len(grp)
+        # A sector is degenerate on a metric when its winsorized spread is
+        # effectively zero, which forces every z-score in it to 0.
+        degenerate = sum(
+            1 for m in WEIGHTS
+            if grp[f"{m}_wins"].std() <= ZERO_VARIANCE_TOL * max(1e-12, abs(grp[f"{m}_wins"].mean()))
+            or pd.isna(grp[f"{m}_wins"].std())
+        )
+        if n <= ARTIFACT_PER_SECTOR:
+            verdict, reason = "ARTIFACT", f"only {n} name(s); z-scores are arithmetic, not signal"
+        elif n < RELIABLE_PER_SECTOR:
+            verdict, reason = "WEAK", f"{n} names; one company moves the sector mean"
+        elif degenerate:
+            verdict, reason = "WEAK", f"{degenerate} of {len(WEIGHTS)} metrics have no spread"
+        else:
+            verdict, reason = "OK", ""
+        rows.append({
+            "sector": sector,
+            "n": n,
+            "best_score": grp["score"].max(),
+            "median_score": grp["score"].median(),
+            "best_ticker": grp.loc[grp["score"].idxmax(), "ticker"],
+            "flat_metrics": degenerate,
+            "verdict": verdict,
+            "note": reason,
+        })
+    return pd.DataFrame(rows).sort_values(["verdict", "sector"])
+ 
+ 
+def shortlist(df: pd.DataFrame, per_sector: int, exclude: set[str]) -> pd.DataFrame:
+    """Top `per_sector` names from each sector, skipping excluded sectors.
+ 
+    The per-sector cut is what keeps a shortlist from filling up with whichever
+    sector happened to score well -- the same reason the scoring is
+    within-sector in the first place.
+    """
+    kept = df[~df["sector"].isin(exclude)]
+    picks = (kept.sort_values("score", ascending=False)
+                 .groupby("sector", group_keys=False)
+                 .head(per_sector))
+    return picks.sort_values(["sector", "score"], ascending=[True, False])
+ 
+ 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--top", type=int, default=20, help="size of the shortlist")
     ap.add_argument("--out", default=None, help="write full ranked table to this CSV")
+    ap.add_argument("--sector-report", action="store_true",
+                    help="per-sector counts, best score, and whether it can be trusted")
+    ap.add_argument("--per-sector", type=int, default=None,
+                    help="take this many names from each sector instead of a flat top-N")
+    ap.add_argument("--exclude-sector", action="append", default=[],
+                    help="sector to leave out (repeatable); record WHY in your report")
     args = ap.parse_args()
  
     df = pd.read_csv(args.csv)
@@ -153,10 +249,29 @@ def main() -> int:
  
     cols = ["rank", "ticker", "company", "sector", "score",
             "z_roic", "z_fcf_yield", "z_rev_cagr_3y", "z_net_debt_ebitda"]
+    fmt = {c: "{:+.2f}".format for c in cols if c.startswith(("z_", "score"))}
+ 
     with pd.option_context("display.width", 200, "display.max_columns", 50):
-        print(f"--- top {args.top} of {len(ranked)} ---")
-        print(ranked.head(args.top)[cols].to_string(index=False,
-              formatters={c: "{:+.2f}".format for c in cols if c.startswith(("z_", "score"))}))
+        if args.sector_report:
+            rep = sector_report(ranked)
+            print("--- sector report ---")
+            print(rep.to_string(index=False, formatters={
+                "best_score": "{:+.2f}".format, "median_score": "{:+.2f}".format}))
+            print("\nVerdict says only whether a sector's z-scores are reliable. Best scores "
+                  "are NOT comparable between sectors -- that comparison is what "
+                  "within-sector scoring removes. Which sectors to hold is a client "
+                  "judgment, not an output of this table.\n")
+ 
+        if args.per_sector:
+            picks = shortlist(ranked, args.per_sector, set(args.exclude_sector))
+            label = f"top {args.per_sector} per sector"
+            if args.exclude_sector:
+                label += f", excluding {', '.join(args.exclude_sector)}"
+            print(f"--- {label}: {len(picks)} names ---")
+            print(picks[cols].to_string(index=False, formatters=fmt))
+        else:
+            print(f"--- top {args.top} of {len(ranked)} ---")
+            print(ranked.head(args.top)[cols].to_string(index=False, formatters=fmt))
  
     if args.out:
         ranked.to_csv(args.out, index=False)
